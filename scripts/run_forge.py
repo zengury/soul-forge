@@ -1,209 +1,343 @@
 #!/usr/bin/env python3
 """
-soul-forge: Agent-friendly pipeline runner
+soul-forge agent-loop runner
 
-用法（供 OpenClaw agent 调用）：
-  python3 run_forge.py --file /path/to/chat.json        # 完整运行
-  python3 run_forge.py --file /path/to/chat.json --stage 1,2   # 指定阶段
-  python3 run_forge.py --status                          # 查看当前进度
-  python3 run_forge.py --resume                          # 从断点继续
-  python3 run_forge.py --soul-only                       # 只生成 soul，跳过 persona
-  python3 run_forge.py --persona-only                    # 跳过 soul，只生成 persona
-
-输出约定（agent 解析用）：
-  [STAGE:N:START]  阶段N开始
-  [STAGE:N:DONE]   阶段N完成
-  [PROGRESS:N/M]   进度
-  [OUTPUT:path]    生成文件路径
-  [ERROR:msg]      错误
-  [DONE]           全部完成
+Agent 通过这个脚本做所有文件 I/O，自己用配置好的模型做 LLM 工作。
+不需要额外配置 API key——所有 LLM 调用由 OpenClaw agent 自己完成。
 """
 
 import argparse
 import json
-import os
-import subprocess
 import sys
-import time
-from datetime import datetime
 from pathlib import Path
+from collections import defaultdict
 
-# ── 路径 ──────────────────────────────────────────────────────────────────────
 SKILL_DIR = Path(__file__).parent.parent
 PIPELINE_DIR = SKILL_DIR / "pipeline"
 PROMPTS_DIR = SKILL_DIR / "prompts"
+sys.path.insert(0, str(PIPELINE_DIR))
 
-# 输出目录：优先用环境变量，否则在 skill 目录旁边建 output/
-OUTPUT_DIR = Path(os.environ.get("SOUL_FORGE_OUTPUT", SKILL_DIR.parent / "soul-forge-output"))
-STATE_FILE = OUTPUT_DIR / ".forge_state.json"
+BATCH_SIZE = 20
 
-STAGES = {
-    1: ("01_parse.py",    "解析聊天记录"),
-    2: ("02_denoise.py",  "去噪 + 对话分块"),
-    3: ("03_extract.py",  "LLM 批量提取行为模式"),
-    4: ("04_synthesize.py","合成 soul.md + persona"),
-}
 
-# ── 状态管理 ──────────────────────────────────────────────────────────────────
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"completed_stages": [], "source_file": None, "started_at": None, "outputs": []}
+def load_config(config_path: str) -> dict:
+    p = Path(config_path).expanduser()
+    if not p.exists():
+        print(f"[ERROR:配置文件不存在：{config_path}]")
+        sys.exit(1)
+    return json.loads(p.read_text())
 
-def save_state(state: dict):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def emit(tag: str, msg: str = ""):
-    """输出 agent 可解析的标记行"""
-    line = f"[{tag}]" + (f" {msg}" if msg else "")
-    print(line, flush=True)
+def get_output_dir(config: dict) -> Path:
+    return Path(config["output_dir"]).expanduser()
 
-# ── 运行单个阶段 ───────────────────────────────────────────────────────────────
-def run_stage(stage_num: int, source_file: Path, extra_args: list = None) -> bool:
-    script_name, label = STAGES[stage_num]
-    script_path = PIPELINE_DIR / script_name
 
-    emit(f"STAGE:{stage_num}:START", label)
+def get_data_dir(config: dict) -> Path:
+    return get_output_dir(config) / "data"
 
-    env = os.environ.copy()
-    env["SOUL_FORGE_SOURCE"] = str(source_file)
-    env["SOUL_FORGE_OUTPUT"] = str(OUTPUT_DIR)
-    env["PYTHONPATH"] = str(PIPELINE_DIR)
 
-    cmd = [sys.executable, str(script_path)]
-    if extra_args:
-        cmd.extend(extra_args)
+def load_state(config: dict) -> dict:
+    state_file = get_output_dir(config) / ".forge_state.json"
+    if state_file.exists():
+        return json.loads(state_file.read_text())
+    return {"stage": 0, "chunks_total": 0, "chunks_done": 0}
 
-    result = subprocess.run(cmd, env=env, text=True)
 
+def save_state(config: dict, state: dict):
+    state_file = get_output_dir(config) / ".forge_state.json"
+    state_file.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+# ── 阶段 1 ────────────────────────────────────────────────────────────────────
+
+def run_stage1(config: dict):
+    import subprocess
+    data_dir = get_data_dir(config)
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        [sys.executable, str(PIPELINE_DIR / "01_parse.py"),
+         "--input", config["input_file"],
+         "--output", str(data_dir / "messages.jsonl"),
+         "--format", config.get("format", "weflow"),
+         "--members", json.dumps(config.get("members", {}))],
+        capture_output=True, text=True
+    )
     if result.returncode != 0:
-        emit(f"STAGE:{stage_num}:FAIL", f"退出码 {result.returncode}")
-        return False
+        print(f"[ERROR:{result.stderr.strip()}]")
+        sys.exit(1)
+    count = sum(1 for _ in (data_dir / "messages.jsonl").open())
+    print(f"[STAGE:1:DONE] 解析完成，共 {count} 条消息")
 
-    emit(f"STAGE:{stage_num}:DONE", label)
-    return True
 
-# ── 主流程 ────────────────────────────────────────────────────────────────────
-def cmd_run(args):
-    source_file = Path(args.file).expanduser().resolve()
-    if not source_file.exists():
-        emit("ERROR", f"文件不存在：{source_file}")
+# ── 阶段 2 ────────────────────────────────────────────────────────────────────
+
+def run_stage2(config: dict):
+    import subprocess
+    data_dir = get_data_dir(config)
+
+    result = subprocess.run(
+        [sys.executable, str(PIPELINE_DIR / "02_denoise.py"),
+         "--input", str(data_dir / "messages.jsonl"),
+         "--output", str(data_dir / "chunks.jsonl")],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"[ERROR:{result.stderr.strip()}]")
         sys.exit(1)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    chunks = [json.loads(l) for l in (data_dir / "chunks.jsonl").open()]
+    state = load_state(config)
+    state["stage"] = 2
+    state["chunks_total"] = len(chunks)
+    save_state(config, state)
+    print(f"[STAGE:2:DONE] 分块完成，共 {len(chunks)} 个对话块")
 
-    state = load_state()
-    state["source_file"] = str(source_file)
-    state["started_at"] = datetime.now().isoformat()
-    save_state(state)
 
-    # 决定运行哪些阶段
-    if args.stages:
-        stages = sorted(int(s) for s in args.stages.split(","))
-    elif args.persona_only:
-        stages = [4]
-    elif args.soul_only:
-        stages = [1, 2, 3, 4]  # stage 4 will use --soul-only flag
+# ── 阶段 3：获取下一批 ────────────────────────────────────────────────────────
+
+def get_next_batch(config: dict):
+    data_dir = get_data_dir(config)
+    obs_file = data_dir / "observations.jsonl"
+
+    done_ids = set()
+    if obs_file.exists():
+        for line in obs_file.open():
+            try:
+                done_ids.add(json.loads(line)["chunk_id"])
+            except Exception:
+                pass
+
+    all_chunks = []
+    for line in (data_dir / "chunks.jsonl").open():
+        try:
+            all_chunks.append(json.loads(line))
+        except Exception:
+            pass
+
+    pending = [c for c in all_chunks if c["chunk_id"] not in done_ids]
+
+    if not pending:
+        print("[BATCH:DONE]")
+        return
+
+    batch = pending[:BATCH_SIZE]
+    total = len(all_chunks)
+    done = len(done_ids)
+    batch_num = done // BATCH_SIZE + 1
+    total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+    print(f"[BATCH:{batch_num}/{total_batches}]")
+    print(f"[PROGRESS:{done}/{total}]")
+    print()
+
+    for chunk in batch:
+        print(f"--- chunk-{chunk['chunk_id']} ({chunk.get('time_range', '')}) ---")
+        for msg in chunk.get("messages", []):
+            role = msg.get("display", msg.get("sender", "?"))
+            print(f"{role}: {msg.get('content', '')}")
+        print()
+
+    prompt_text = (PROMPTS_DIR / "extract_patterns.md").read_text()
+    print("=== 提取 Prompt ===")
+    print(prompt_text)
+    print()
+    print("请按照上面的 prompt 分析这批对话块，输出 JSON 数组，每个元素对应一个 chunk_id。")
+    print(f"完成后调用：python3 {__file__} --stage 3 --save-batch --config {config.get('_path','')} --result '<JSON>'")
+
+
+# ── 阶段 3：保存批次结果 ──────────────────────────────────────────────────────
+
+def save_batch(config: dict, result_json: str):
+    data_dir = get_data_dir(config)
+    obs_file = data_dir / "observations.jsonl"
+
+    try:
+        observations = json.loads(result_json)
+        if isinstance(observations, dict):
+            observations = [observations]
+    except json.JSONDecodeError as e:
+        print(f"[ERROR:JSON解析失败：{e}]")
+        sys.exit(1)
+
+    saved = 0
+    with obs_file.open("a", encoding="utf-8") as f:
+        for obs in observations:
+            if obs.get("has_signal", True):
+                f.write(json.dumps(obs, ensure_ascii=False) + "\n")
+                saved += 1
+
+    done_ids = set()
+    for line in obs_file.open():
+        try:
+            done_ids.add(json.loads(line)["chunk_id"])
+        except Exception:
+            pass
+    total = sum(1 for _ in (data_dir / "chunks.jsonl").open())
+
+    print(f"[BATCH:SAVED] 保存 {saved} 条有信号观察")
+    print(f"[PROGRESS:{len(done_ids)}/{total}]")
+
+
+# ── 阶段 4：加载观察记录 ──────────────────────────────────────────────────────
+
+def load_observations(config: dict):
+    data_dir = get_data_dir(config)
+    obs_file = data_dir / "observations.jsonl"
+
+    if not obs_file.exists():
+        print("[ERROR:observations.jsonl 不存在，请先完成阶段3]")
+        sys.exit(1)
+
+    observations = []
+    for line in obs_file.open():
+        try:
+            observations.append(json.loads(line))
+        except Exception:
+            pass
+
+    print(f"[OBSERVATIONS:共 {len(observations)} 条观察记录]")
+    print()
+
+    by_member = defaultdict(list)
+    collective = []
+
+    for obs in observations:
+        o = obs.get("observations", {})
+        if not o:
+            continue
+        lang = o.get("language", {})
+        for role in ["dad", "mom", "child"]:
+            if lang.get(role):
+                by_member[role].append({
+                    "time": obs.get("time_range", ""),
+                    "language": lang[role],
+                    "emotional": o.get("emotional_patterns", ""),
+                    "values": o.get("values", ""),
+                })
+        collective.append({
+            "time": obs.get("time_range", ""),
+            "relational": o.get("relational_dynamics", ""),
+            "collective": o.get("collective_identity", ""),
+        })
+        for q in obs.get("notable_quotes", []) or []:
+            if q:
+                by_member[q.get("role", "?")].append({"quote": q})
+
+    print("=== 集体观察（用于生成 soul.md）===")
+    for item in collective[:80]:
+        print(f"[{item['time']}] 关系：{item['relational'][:120]}")
+        print(f"  集体：{item['collective'][:120]}")
+    print()
+
+    for role, items in by_member.items():
+        print(f"=== {role} 观察（用于生成 persona_{role}.md）===")
+        for item in items[:40]:
+            if "quote" in item:
+                print(f"  名言：{item['quote']}")
+            else:
+                print(f"  [{item['time']}] {item.get('language','')[:120]}")
+        print()
+
+    soul_prompt = (PROMPTS_DIR / "synthesize_soul.md").read_text()
+    print("=== soul.md 综合 Prompt ===")
+    print(soul_prompt)
+    print()
+    print(f"完成后调用：python3 {__file__} --stage 4 --save --file soul.md --config ... --content '<内容>'")
+    print(f"然后依次为每个成员生成 persona，使用：{PROMPTS_DIR / 'synthesize_persona.md'}")
+
+
+# ── 阶段 4：保存输出文件 ──────────────────────────────────────────────────────
+
+def save_output_file(config: dict, filename: str, content: str):
+    output_dir = get_output_dir(config)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / filename
+    out_path.write_text(content, encoding="utf-8")
+    print(f"[OUTPUT:{out_path}] 已保存 {len(content)} 字符")
+
+
+# ── 状态查询 ──────────────────────────────────────────────────────────────────
+
+def show_status(config: dict):
+    data_dir = get_data_dir(config)
+    output_dir = get_output_dir(config)
+
+    print("=== soul-forge 状态 ===")
+    print(f"输入：{config.get('input_file','未设置')}")
+    print(f"输出：{output_dir}")
+    print()
+
+    chunks_file = data_dir / "chunks.jsonl"
+    if not chunks_file.exists():
+        print("阶段1-2：未完成")
+        return
+
+    total = sum(1 for _ in chunks_file.open())
+    print(f"对话块：{total} 个")
+
+    obs_file = data_dir / "observations.jsonl"
+    if obs_file.exists():
+        done = sum(1 for _ in obs_file.open())
+        pct = done * 100 // total if total else 0
+        print(f"已提取：{done}/{total} 块（{pct}%）")
     else:
-        stages = [1, 2, 3, 4]
+        print("阶段3：未开始")
 
-    total = len(stages)
-    for i, stage_num in enumerate(stages, 1):
-        emit(f"PROGRESS", f"{i}/{total} 阶段{stage_num}")
+    for fname in ["soul.md", "persona_dad.md", "persona_mom.md", "persona_child.md"]:
+        f = output_dir / fname
+        status = f"✓ ({f.stat().st_size} 字节)" if f.exists() else "✗ 未生成"
+        print(f"  {fname}: {status}")
 
-        extra = []
-        if stage_num == 4:
-            if args.soul_only:
-                extra = ["--soul-only"]
-            elif args.persona_only:
-                extra = ["--persona-only"]
 
-        ok = run_stage(stage_num, source_file, extra)
-        if not ok:
-            emit("ERROR", f"阶段{stage_num}失败，中止")
-            sys.exit(1)
+# ── 主入口 ────────────────────────────────────────────────────────────────────
 
-        state["completed_stages"].append(stage_num)
-        save_state(state)
-
-    # 列出生成的文件
-    output_files = list(OUTPUT_DIR.glob("*.md"))
-    for f in sorted(output_files):
-        emit("OUTPUT", str(f))
-        state["outputs"].append(str(f))
-
-    save_state(state)
-    emit("DONE", f"共生成 {len(output_files)} 个文件 → {OUTPUT_DIR}")
-
-def cmd_status(args):
-    state = load_state()
-    if not state["source_file"]:
-        print("尚未运行过 soul-forge")
-        return
-
-    print(f"源文件：{state['source_file']}")
-    print(f"开始时间：{state['started_at']}")
-    print(f"已完成阶段：{state['completed_stages']}")
-    remaining = [s for s in [1,2,3,4] if s not in state["completed_stages"]]
-    print(f"待完成阶段：{remaining}")
-    if state["outputs"]:
-        print("输出文件：")
-        for f in state["outputs"]:
-            print(f"  {f}")
-
-def cmd_resume(args):
-    state = load_state()
-    if not state["source_file"]:
-        emit("ERROR", "没有可恢复的任务，请先用 --file 指定源文件")
-        sys.exit(1)
-
-    completed = set(state["completed_stages"])
-    remaining = [s for s in [1, 2, 3, 4] if s not in completed]
-
-    if not remaining:
-        emit("DONE", "所有阶段已完成，无需恢复")
-        return
-
-    print(f"从阶段 {remaining[0]} 继续…")
-    source_file = Path(state["source_file"])
-
-    for i, stage_num in enumerate(remaining, 1):
-        emit(f"PROGRESS", f"{i}/{len(remaining)} 阶段{stage_num}（恢复）")
-        ok = run_stage(stage_num, source_file)
-        if not ok:
-            emit("ERROR", f"阶段{stage_num}失败")
-            sys.exit(1)
-        state["completed_stages"].append(stage_num)
-        save_state(state)
-
-    output_files = list(OUTPUT_DIR.glob("*.md"))
-    for f in sorted(output_files):
-        emit("OUTPUT", str(f))
-    emit("DONE", f"恢复完成，共 {len(output_files)} 个文件")
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="soul-forge pipeline runner")
-    sub = parser.add_subparsers(dest="cmd")
-
-    # run（默认）
-    run_p = parser.add_argument_group("run options")
-    parser.add_argument("--file", "-f", help="聊天记录文件路径（JSON）")
-    parser.add_argument("--stages", help="指定阶段，逗号分隔，如 1,2 或 3,4")
-    parser.add_argument("--soul-only", action="store_true", help="只生成 soul.md，跳过 persona")
-    parser.add_argument("--persona-only", action="store_true", help="跳过 soul，只生成/更新 persona")
-    parser.add_argument("--status", action="store_true", help="查看当前进度")
-    parser.add_argument("--resume", action="store_true", help="从断点继续")
-
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stage", type=int, choices=[1, 2, 3, 4])
+    parser.add_argument("--config", required=False)
+    parser.add_argument("--next-batch", action="store_true")
+    parser.add_argument("--save-batch", action="store_true")
+    parser.add_argument("--load-observations", action="store_true")
+    parser.add_argument("--save", action="store_true")
+    parser.add_argument("--file", type=str)
+    parser.add_argument("--result", type=str)
+    parser.add_argument("--content", type=str)
+    parser.add_argument("--status", action="store_true")
     args = parser.parse_args()
 
+    if not args.config:
+        print("[ERROR:请提供 --config 参数]")
+        sys.exit(1)
+
+    config = load_config(args.config)
+    config["_path"] = args.config
+
     if args.status:
-        cmd_status(args)
-    elif args.resume:
-        cmd_resume(args)
-    elif args.file:
-        cmd_run(args)
+        show_status(config)
+    elif args.stage == 1:
+        run_stage1(config)
+    elif args.stage == 2:
+        run_stage2(config)
+    elif args.stage == 3:
+        if args.next_batch:
+            get_next_batch(config)
+        elif args.save_batch:
+            if not args.result:
+                print("[ERROR:--save-batch 需要 --result 参数]")
+                sys.exit(1)
+            save_batch(config, args.result)
+    elif args.stage == 4:
+        if args.load_observations:
+            load_observations(config)
+        elif args.save:
+            if not args.file or not args.content:
+                print("[ERROR:--save 需要 --file 和 --content]")
+                sys.exit(1)
+            save_output_file(config, args.file, args.content)
     else:
         parser.print_help()
-        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

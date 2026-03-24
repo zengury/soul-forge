@@ -1,2 +1,4 @@
-anthropic>=0.40.0
-httpx>=0.25.0
+# soul-forge 依赖
+# 不需要 anthropic 包——所有 LLM 调用由 OpenClaw agent 自己完成
+# 仅依赖 Python 标准库
+
