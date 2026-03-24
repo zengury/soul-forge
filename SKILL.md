@@ -133,6 +133,36 @@ python3 {SKILL_DIR}/scripts/run_forge.py --stage 4 --save --file soul.md --confi
 | "只刷新 persona" | 跳过阶段 3，重新综合各 persona |
 | "继续上次的任务" | 检查进度，从上次中断的批次继续 |
 | "soul-forge 状态" | 显示当前进度和已处理的块数 |
+| "soul-forge 分时运行" | 获取避免 rate limit 的调度方案 |
+
+---
+
+## Rate Limit 处理：分时运行
+
+**背景**：阶段3需要处理大量对话块，密集调用模型可能触发 rate limit。
+
+**建议方案：** 告诉 agent：
+
+```
+soul-forge 用分时模式处理，每小时 3 批，今晚开始
+```
+
+Agent 会执行：
+```bash
+python3 {SKILL_DIR}/scripts/run_forge.py --stage 3 --next-batch \
+  --config {config_path} --max-batches 3 --delay 10
+```
+
+- `--max-batches 3`：每次只处理 3 批（60 个对话块），然后停止
+- `--delay 10`：每批之间等 10 秒
+- 每次运行后进度自动保存，下次从断点继续，**不重复处理**
+
+**获取完整调度方案**（含 cron 配置）：
+```bash
+python3 {SKILL_DIR}/scripts/run_forge.py --schedule --config {config_path} --max-batches 3
+```
+
+**人工分次模式**：每次在 OpenClaw 说"处理下一批"，agent 处理 3 批后停止，用户可随时继续。
 
 ---
 

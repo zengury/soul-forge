@@ -9,6 +9,7 @@ Agent 通过这个脚本做所有文件 I/O，自己用配置好的模型做 LLM
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from collections import defaultdict
 
@@ -18,6 +19,8 @@ PROMPTS_DIR = SKILL_DIR / "prompts"
 sys.path.insert(0, str(PIPELINE_DIR))
 
 BATCH_SIZE = 20
+DEFAULT_BATCH_DELAY = 3   # 每批之间默认等待秒数
+DEFAULT_MAX_BATCHES = 3   # 默认每次运行处理批数（限速模式）
 
 
 def load_config(config_path: str) -> dict:
@@ -96,7 +99,11 @@ def run_stage2(config: dict):
 
 # ── 阶段 3：获取下一批 ────────────────────────────────────────────────────────
 
-def get_next_batch(config: dict):
+def get_next_batch(config: dict, max_batches: int = 0, delay_seconds: int = 0):
+    """
+    max_batches: 本次最多处理几批（0=不限制，由 agent 自行决定何时停止）
+    delay_seconds: 批次之间等待秒数（用于限速）
+    """
     data_dir = get_data_dir(config)
     obs_file = data_dir / "observations.jsonl"
 
@@ -121,14 +128,26 @@ def get_next_batch(config: dict):
         print("[BATCH:DONE]")
         return
 
-    batch = pending[:BATCH_SIZE]
     total = len(all_chunks)
     done = len(done_ids)
-    batch_num = done // BATCH_SIZE + 1
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    batch_num = done // BATCH_SIZE + 1
 
+    # 限速模式：只输出 max_batches 批
+    if max_batches > 0:
+        remaining_tonight = total_batches - (done // BATCH_SIZE)
+        will_do = min(max_batches, remaining_tonight)
+        eta_hours = (total_batches - done // BATCH_SIZE) // max_batches + 1 if max_batches else 0
+        print(f"[RATE_LIMIT_MODE] 本次处理 {will_do} 批，预计需要约 {eta_hours} 小时全部完成")
+        print(f"[SCHEDULE_HINT] 建议在午夜后每小时自动运行一次，每次处理 {max_batches} 批")
+        print()
+
+    batch = pending[:BATCH_SIZE]
     print(f"[BATCH:{batch_num}/{total_batches}]")
     print(f"[PROGRESS:{done}/{total}]")
+
+    if delay_seconds > 0:
+        print(f"[DELAY:{delay_seconds}s] 批次间将等待 {delay_seconds} 秒以避免触发 rate limit")
     print()
 
     for chunk in batch:
@@ -142,8 +161,20 @@ def get_next_batch(config: dict):
     print("=== 提取 Prompt ===")
     print(prompt_text)
     print()
+
+    # 构建下一步调用命令（含限速参数）
+    rate_flags = ""
+    if max_batches > 0:
+        rate_flags += f" --max-batches {max_batches}"
+    if delay_seconds > 0:
+        rate_flags += f" --delay {delay_seconds}"
+
     print("请按照上面的 prompt 分析这批对话块，输出 JSON 数组，每个元素对应一个 chunk_id。")
     print(f"完成后调用：python3 {__file__} --stage 3 --save-batch --config {config.get('_path','')} --result '<JSON>'")
+    if max_batches > 0:
+        print()
+        print(f"[NEXT_BATCH_CMD] 保存完成后继续下一批（还剩 {len(pending) - BATCH_SIZE} 个块）：")
+        print(f"  python3 {__file__} --stage 3 --next-batch --config {config.get('_path','')}{rate_flags}")
 
 
 # ── 阶段 3：保存批次结果 ──────────────────────────────────────────────────────
@@ -290,6 +321,72 @@ def show_status(config: dict):
         print(f"  {fname}: {status}")
 
 
+# ── 调度建议 ──────────────────────────────────────────────────────────────────
+
+def print_schedule_guide(config_path: str, max_batches: int):
+    """
+    输出分时运行建议，帮助用户避免触发 rate limit。
+    不依赖 config 文件是否存在。
+    """
+    script = Path(__file__).resolve()
+    print("""
+=== soul-forge 分时运行方案（避免 Rate Limit）===
+
+原理：每次只处理少量批次，然后停止。
+      下次运行时自动从断点继续，不重复处理。
+
+推荐设置：
+  每批 20 个对话块，每次运行 {max_batches} 批（{chunk_num} 个块）
+  批次间等待 10 秒，降低单位时间 token 消耗
+
+─────────────────────────────────────────────────────
+
+【方案 A：手动分次运行（最简单）】
+
+每次在 OpenClaw 里说："soul-forge 处理下一批"
+Agent 会自动处理 {max_batches} 批后停止，进度自动保存。
+
+─────────────────────────────────────────────────────
+
+【方案 B：Mac 定时任务（推荐，全自动）】
+
+在终端执行以下命令，设置每小时运行一次（凌晨1点-7点）：
+
+  crontab -e
+
+添加以下行：
+
+  0 1-7 * * * openclaw run "{script}" --stage 3 --next-batch --config {config_path} --max-batches {max_batches} --delay 10
+
+或者直接调用脚本（如果 OpenClaw 在终端可用）：
+
+  0 1-7 * * * /usr/bin/python3 "{script}" --stage 3 --next-batch --config {config_path} --max-batches {max_batches} --delay 10
+
+─────────────────────────────────────────────────────
+
+【方案 C：告诉 agent 用定时模式】
+
+在 OpenClaw 中说：
+  "soul-forge 每小时处理 {max_batches} 批，今晚午夜开始"
+
+Agent 会自动设置 OpenClaw 的定时任务。
+
+─────────────────────────────────────────────────────
+
+当前建议参数（基于 20块/批）：
+  --max-batches {max_batches}   每次处理约 {chunk_num} 个对话块
+  --delay 10                    批次间等 10 秒
+
+完成进度查看：
+  python3 "{script}" --status --config {config_path}
+""".format(
+        max_batches=max_batches,
+        chunk_num=max_batches * BATCH_SIZE,
+        script=script,
+        config_path=config_path,
+    ))
+
+
 # ── 主入口 ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -304,7 +401,19 @@ def main():
     parser.add_argument("--result", type=str)
     parser.add_argument("--content", type=str)
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--schedule", action="store_true",
+                        help="输出 cron 配置，用于午夜自动分时运行")
+    parser.add_argument("--max-batches", type=int, default=0,
+                        help="每次运行最多处理几批（0=不限制，建议限速时设为3-5）")
+    parser.add_argument("--delay", type=int, default=0,
+                        help="批次之间等待秒数（建议限速时设为 10-30）")
     args = parser.parse_args()
+
+    if args.schedule:
+        # 不需要 config，直接输出调度建议
+        print_schedule_guide(args.config or "~/.forge_config.json",
+                             args.max_batches or DEFAULT_MAX_BATCHES)
+        return
 
     if not args.config:
         print("[ERROR:请提供 --config 参数]")
@@ -321,7 +430,9 @@ def main():
         run_stage2(config)
     elif args.stage == 3:
         if args.next_batch:
-            get_next_batch(config)
+            get_next_batch(config,
+                           max_batches=args.max_batches,
+                           delay_seconds=args.delay)
         elif args.save_batch:
             if not args.result:
                 print("[ERROR:--save-batch 需要 --result 参数]")
