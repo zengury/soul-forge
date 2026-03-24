@@ -81,4 +81,25 @@ CHUNK_SIZE_TURNS = 40
 BATCH_SIZE = 200
 
 # ── Anthropic API ─────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# Mac GUI 应用（如 OpenClaw）不继承 shell 环境变量，
+# 因此依次从以下位置读取 API key：
+#   1. 环境变量 ANTHROPIC_API_KEY（终端直接运行时有效）
+#   2. ~/.openclaw/workspace/.env
+#   3. ~/.env
+def _load_api_key() -> str:
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key:
+        return key
+    for env_path in [
+        Path.home() / ".openclaw" / "workspace" / ".env",
+        Path.home() / ".env",
+        Path(__file__).parent.parent / ".env",
+    ]:
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("ANTHROPIC_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip("'\"")
+    return ""
+
+ANTHROPIC_API_KEY = _load_api_key()
