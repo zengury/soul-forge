@@ -1,0 +1,19 @@
+# 运行时生成的数据文件
+soul-forge-output/
+data/
+outputs/
+*.jsonl
+*.json
+!package.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
+
+# 检查点状态
+.forge_state.json
