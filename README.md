@@ -1,6 +1,6 @@
 # soul-forge
 
-> 从家庭群聊记录提炼数字人格。一份聊天导出 → soul.md + persona 文件集。
+> 从群聊记录提炼数字人格。一份聊天导出 → soul.md + 每位成员的 persona 文件。
 
 ## 快速安装
 
@@ -19,17 +19,16 @@ rm -rf ~/.openclaw/workspace/skills/soul-forge
 
 # 克隆到 OpenClaw skills 目录
 git clone https://github.com/zengury/soul-forge ~/.openclaw/workspace/skills/soul-forge
-
-# 安装 Python 依赖（Mac 用 pip3）
-pip3 install -r ~/.openclaw/workspace/skills/soul-forge/requirements.txt
 ```
+
+无需额外安装依赖，仅需 Python 3.9+（系统自带）。
 
 ## 使用
 
 在 OpenClaw 对话中说：
 
 ```
-帮我分析这份聊天记录：/path/to/群聊_三头怪.json
+帮我分析这份聊天记录：/path/to/chat_export.json
 ```
 
 或：
@@ -42,33 +41,27 @@ Agent 会自动处理四个阶段，完成后输出：
 
 ```
 soul-forge-output/
-├── soul.md          ← AI agent 人格底座
-├── persona_dad.md
-├── persona_mom.md
-└── persona_child.md
+├── soul.md            ← 集体人格，可直接作为 AI agent 的 SOUL.md 使用
+├── persona_A.md       ← 成员 A 的个人人格
+├── persona_B.md       ← 成员 B 的个人人格
+└── persona_C.md       ← 成员 C 的个人人格
 ```
 
 ## 进阶用法
 
 ```
-soul-forge 只更新 soul         # --soul-only：跳过 persona
-soul-forge 只刷新 persona      # --persona-only：跳过 soul
-soul-forge 继续上次的任务       # --resume：断点续跑，不重复计费
-soul-forge 状态                # --status：查看当前进度
+soul-forge 只更新 soul          # 跳过提取，直接重新综合 soul.md
+soul-forge 只刷新 persona       # 跳过提取，重新生成各成员 persona
+soul-forge 继续上次的任务        # 断点续跑，不重复处理已完成的部分
+soul-forge 状态                 # 查看当前进度
+soul-forge 分时运行             # 获取避免 rate limit 的调度方案
 ```
 
 ## 需要什么
 
-- Python 3.9+
-- `ANTHROPIC_API_KEY` 环境变量（需要 Claude API 权限）
-- 微信群聊 JSON 导出（Mac 用 WeFlow 工具导出）
-
-## 成本估算
-
-一份 2-3 年群聊（约 500 对话块）：**$3-6 一次性**
-
-- 阶段 3（Haiku Batches API）：约 $0.5-1
-- 阶段 4（Opus 综合）：约 $2-5
+- Python 3.9+（通常已安装）
+- OpenClaw（使用你已经配置好的模型，无需额外 API key）
+- 群聊 JSON 或 CSV 导出文件
 
 ## 支持格式
 
@@ -81,13 +74,13 @@ soul-forge 状态                # --status：查看当前进度
 
 基于**数字民族志**（Digital Ethnography）：
 
-- 阶段 1-2：田野记录整理（结构化原始数据）
-- 阶段 3：系统观察（Haiku 提取五维度行为模式）
-- 阶段 4：民族志分析（Opus 综合「厚描」）
+- **阶段 1-2**：田野记录整理 — 解析原始聊天，去噪，按时间分段
+- **阶段 3**：系统性观察 — OpenClaw 对每段对话提取五维度行为模式（语言风格、情感模式、价值观信号、关系动态、集体身份）
+- **阶段 4**：民族志分析 — OpenClaw 综合所有观察，生成「厚描」式人格档案
 
 > Clifford Geertz：「浅描记录行为，厚描解释意义。」
 
-soul.md 不是行为清单，而是理解这个家庭需要什么样的解释框架。
+soul.md 不是行为清单，而是理解这个群体需要什么样的解释框架。
 
 ---
 
